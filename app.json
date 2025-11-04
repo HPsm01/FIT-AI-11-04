@@ -1,9 +1,10 @@
 {
   "expo": {
-    "name": "fe",
+    "name": "THE FIT",
     "slug": "fe",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/The FIT-icon.png",
     "userInterfaceStyle": "light",
     "splash": {
       "image": "./assets/splash.png",
@@ -26,6 +27,10 @@
     "android": {
       "jsEngine": "hermes",
       "package": "com.psm3464.FE",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/The FIT-icon.png",
+        "backgroundColor": "#0a0e27"
+      },
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.READ_EXTERNAL_STORAGE",

@@ -17,6 +17,13 @@ import CommonHeader from './CommonHeader';
 const API_BASE = 'http://13.209.67.129:8000';
 const EXERCISE_DIR = { deadlift: 'deadlift', squat: 'squat', bench_press: 'bench_press' };
 
+// ⚠️ 데이터 동기화 정책 (서버 우선 모드)
+// 1. 서버 = 단일 진실 소스 (Single Source of Truth)
+// 2. 로컬 스토리지 = 캐시 (빠른 로딩용)
+// 3. 데이터 로딩 순서: 서버 먼저 → 서버 없으면 로컬 캐시
+// 4. 영상 업로드 후: 서버 데이터로 완전 교체 (로컬 병합 없음)
+// 5. 여러 기기 사용 시: 각 기기가 서버에서 최신 데이터 가져옴
+
 // S3 경로 수정 (fitvideoresult 폴더 사용)
 const S3_RESULT_FOLDER = 'fitvideoresult';
 
@@ -140,6 +147,25 @@ const aiMemoFromItem = (item) => {
 
 // fallbackMemoFromItem 제거 - ai_feedback만 사용
 
+// S3 키에서 무게 추출 함수
+// 형식: fitvideo/{userId}_{userName}_{weightKg}_{exerciseId}_{timestamp}.mp4
+const extractWeightFromS3Key = (s3Key) => {
+  if (!s3Key) return null;
+  try {
+    // s3Key 예: "fitvideo/fitvideo/20_박승민_80_2_20251021160856.mp4"
+    const fileName = s3Key.split('/').pop(); // "20_박승민_80_2_20251021160856.mp4"
+    const parts = fileName.split('_'); // ["20", "박승민", "80", "2", "20251021160856.mp4"]
+    
+    if (parts.length >= 3) {
+      const weightKg = parseFloat(parts[2]); // 80
+      return isNaN(weightKg) ? null : weightKg;
+    }
+  } catch (error) {
+    console.error('S3 키에서 무게 추출 실패:', error);
+  }
+  return null;
+};
+
 // ================================
 // 화면/상태
 // ================================
@@ -245,34 +271,44 @@ export default function MyExerciseScreen({ navigation, route }) {
   // ================================
   const loadExerciseSetsFromStorage = async (date = selectedDate) => {
     try {
+      console.log('🔄 데이터 로딩 시작 - 서버 우선 모드', formatDateForStorage(date));
+      
+      // 1단계: 서버에서 최신 데이터 가져오기 (서버가 단일 진실 소스)
+      await loadExerciseDataFromServer(date, null);
+
+      // 2단계: 서버 데이터가 없는 경우에만 로컬 캐시 확인
       const key = `exerciseSets_${user?.id}_${formatDateForStorage(date)}`;
       const saved = await AsyncStorage.getItem(key);
 
-      let localData;
       if (saved) {
-        localData = JSON.parse(saved);
-        setExerciseSets(localData); // 로컬 스토리지 데이터를 정확히 반영
-        console.log('✅ 로컬 스토리지에서 데이터 로드:', Object.keys(localData).map(k => `${k}: ${localData[k].length}개`));
+        const localData = JSON.parse(saved);
+        // 서버 데이터가 없고 로컬에만 있는 경우 로컬 데이터 사용
+        setExerciseSets(prev => {
+          // 서버에서 이미 데이터를 받았으면 로컬 데이터 무시
+          const hasServerData = prev[selectedExercise]?.some(set => set.videoUploaded);
+          if (hasServerData) {
+            console.log('✅ 서버 데이터 우선 사용 - 로컬 캐시 무시');
+            return prev;
+          }
+          console.log('ℹ️ 서버 데이터 없음 - 로컬 캐시 사용');
+          return localData;
+        });
       } else {
-        // 해당 날짜에 데이터가 없으면 빈 세트로 초기화
-        localData = {
+        // 로컬 캐시도 없으면 기본 세트로 초기화 (이전 날짜 데이터 제거)
+        console.log('ℹ️ 로컬 캐시 없음 - 기본 세트로 초기화');
+        setExerciseSets({
           deadlift: generateSets(),
           squat: generateSets(),
           bench_press: generateSets(),
-        };
-        setExerciseSets(localData);
-        console.log('ℹ️ 로컬 데이터 없음 - 기본 5개 세트로 초기화');
+        });
       }
-
-      // 서버에서도 해당 날짜의 운동 데이터를 불러와서 병합 (로컬 데이터를 직접 전달)
-      await loadExerciseDataFromServer(date, localData);
 
     } catch (e) {
       console.error('세트 데이터 불러오기 실패:', e);
     }
   };
 
-  // 서버에서 특정 날짜의 운동 데이터(생성일 기준) 불러와서 로컬과 병합
+  // 서버에서 특정 날짜의 운동 데이터(생성일 기준) 불러오기 - 서버 우선 모드
   const loadExerciseDataFromServer = async (date, localData = null) => {
     if (!user?.id) return;
     try {
@@ -289,15 +325,20 @@ export default function MyExerciseScreen({ navigation, route }) {
       const serverList = Array.isArray(payload?.items) ? payload.items : [];
 
       if (serverList.length > 0) {
-        // ✅ 서버 → 로컬 세트 형태로 변환 (ai_feedback만 사용)
-        const normalized = serverList.map((it) => {
+        // ✅ 서버 데이터를 직접 state로 변환 (로컬 병합 없이)
+        const serverSets = serverList.map((it, idx) => {
           const memoFromAI = aiMemoFromItem(it);
+          
+          // 무게 데이터 추출: load_kg > weight > S3 키에서 추출
+          const weightFromS3 = extractWeightFromS3Key(it.s3_key);
+          const weightValue = it.load_kg || it.weight || weightFromS3;
+          const weight = weightValue ? String(weightValue) : ''; // 항상 문자열로 변환
           
           // AI 피드백이 있으면 그것을 사용, 없으면 분석 대기 중으로 표시
           let memo;
           if (memoFromAI) {
             memo = memoFromAI; // AI 피드백이 있음
-          } else if (!!it.weight) {
+          } else if (weight) {
             memo = '영상 업로드 완료 - 분석 대기 중...'; // 무게는 있지만 AI 피드백 없음 = 분석 중
           } else {
             memo = '피드백 없음'; // 무게도 없고 AI 피드백도 없음
@@ -308,25 +349,53 @@ export default function MyExerciseScreen({ navigation, route }) {
           
           return {
             exercise: selectedExercise,
-            weight: it.weight || '',
+            weight: weight,
             reps: it.rep_cnt || '',
             memo,
             analysisVideoUrl, // 분석 영상 URL 저장
-            weightLocked: !!it.weight,
-            videoUploaded: !!it.weight, // 서버에 무게 데이터가 있으면 영상 업로드 완료로 간주
+            weightLocked: !!weight,
+            videoUploaded: !!weight, // 서버에 무게 데이터가 있으면 영상 업로드 완료로 간주
           };
         });
 
-        // localData가 전달되면 그것을 사용, 아니면 현재 state 사용
-        const dataToMerge = localData || exerciseSets;
-        const merged = mergeServerDataWithLocal(dataToMerge, normalized, selectedExercise);
-        setExerciseSets(merged);
-        await saveExerciseSetsToStorage(merged, date);
-        console.log('✅ 날짜별 서버 데이터 병합 완료:', `${selectedExercise} ${merged[selectedExercise]?.length || 0}개 세트`);
+        // 서버 세트가 5개 미만이면 빈 세트를 추가하여 최소 5개 유지
+        const minSets = 5;
+        const finalSets = [...serverSets];
+        
+        if (finalSets.length < minSets) {
+          const emptySetsNeeded = minSets - finalSets.length;
+          for (let i = 0; i < emptySetsNeeded; i++) {
+            finalSets.push({
+              exercise: selectedExercise,
+              weight: '',
+              reps: '',
+              feedbackVideo: null,
+              analysisVideoUrl: null,
+              memo: '',
+              weightLocked: false,
+              videoUploaded: false,
+            });
+          }
+          console.log(`📝 서버 세트 ${serverSets.length}개 + 빈 세트 ${emptySetsNeeded}개 = 총 ${finalSets.length}개`);
+        }
+
+        // 서버 데이터로 직접 교체 (병합 없이)
+        // ⚠️ 주의: 현재 선택된 운동만 교체, 다른 운동은 유지
+        const updatedSets = {
+          ...exerciseSets,
+          [selectedExercise]: finalSets
+        };
+        
+        setExerciseSets(updatedSets);
+
+        // 로컬 캐시 업데이트 (다음 로딩 속도 향상용)
+        saveExerciseSetsToStorage(updatedSets, date);
+        
+        console.log('✅ 서버 데이터로 직접 교체 완료:', `${selectedExercise} ${finalSets.length}개 세트 (서버: ${serverSets.length}개)`);
       } else {
-        // 서버 데이터 없음 → total=0 반영
+        // 서버 데이터 없음 → 아무것도 하지 않음 (loadExerciseSetsFromStorage에서 처리)
         setDailyTotalReps(0);
-        console.log('ℹ️ 해당 날짜에 서버 데이터 없음');
+        console.log('ℹ️ 서버 데이터 없음 - loadExerciseSetsFromStorage에서 로컬 캐시 또는 기본 세트 처리');
       }
     } catch (e) {
       console.error('❌ 날짜별 서버 데이터 불러오기 실패:', e);
@@ -338,6 +407,7 @@ export default function MyExerciseScreen({ navigation, route }) {
     try {
       const key = `exerciseSets_${user?.id}_${formatDateForStorage(date)}`;
       await AsyncStorage.setItem(key, JSON.stringify(sets));
+      console.log('💾 로컬 캐시 저장 완료');
     } catch (e) {
       console.error('세트 데이터 저장 실패:', e);
     }
@@ -366,7 +436,7 @@ export default function MyExerciseScreen({ navigation, route }) {
         // 운동 기록이 있는지 확인
         if (workoutData) {
           const hasWorkout = Object.values(workoutData).some(exercise =>
-            exercise.some(set => set.weight && set.weight.trim() !== '')
+            exercise.some(set => set.weight && String(set.weight).trim() !== '')
           );
 
           if (hasWorkout) {
@@ -385,50 +455,8 @@ export default function MyExerciseScreen({ navigation, route }) {
     }
   };
 
-  // 서버 데이터와 로컬 데이터 병합
-  const mergeServerDataWithLocal = (localData, serverData, targetExercise) => {
-    const merged = { ...localData };
-
-    // targetExercise가 지정된 경우, 해당 운동만 병합
-    if (targetExercise && merged[targetExercise] && Array.isArray(merged[targetExercise])) {
-      merged[targetExercise] = merged[targetExercise].map((set, idx) => {
-        const serverSet = serverData[idx];
-        if (serverSet) {
-          return {
-            ...set,
-            weight: serverSet.weight || set.weight,
-            reps: serverSet.reps || set.reps,
-            memo: serverSet.memo || set.memo || '피드백 없음',
-            weightLocked: serverSet.weightLocked || set.weightLocked, // 로컬 상태 보존
-            videoUploaded: set.videoUploaded || serverSet.videoUploaded, // 로컬 상태 우선
-          };
-        }
-        return set;
-      });
-    } else {
-      // targetExercise가 없으면 모든 운동 병합 (이전 방식)
-      Object.keys(merged).forEach(exercise => {
-        if (merged[exercise] && Array.isArray(merged[exercise])) {
-          merged[exercise] = merged[exercise].map((set, idx) => {
-            const serverSet = serverData[idx];
-            if (serverSet) {
-              return {
-                ...set,
-                weight: serverSet.weight || set.weight,
-                reps: serverSet.reps || set.reps,
-                memo: serverSet.memo || set.memo || '피드백 없음',
-                weightLocked: serverSet.weightLocked || set.weightLocked, // 로컬 상태 보존
-                videoUploaded: set.videoUploaded || serverSet.videoUploaded, // 로컬 상태 우선
-              };
-            }
-            return set;
-          });
-        }
-      });
-    }
-
-    return merged;
-  };
+  // ⚠️ 더 이상 사용하지 않음 - 서버 데이터를 직접 사용하도록 변경됨
+  // 서버 우선 모드에서는 로컬과 병합하지 않고 서버 데이터를 그대로 사용
 
   // ================================
   // 권한/브라우저 열기
@@ -553,7 +581,7 @@ export default function MyExerciseScreen({ navigation, route }) {
     }
 
     const set = exerciseSets[selectedExercise][idx];
-    if (!set.weight || set.weight.trim() === '') {
+    if (!set.weight || String(set.weight).trim() === '') {
       Alert.alert('알림', '무게를 먼저 입력해주세요.');
       return;
     }
@@ -597,6 +625,8 @@ export default function MyExerciseScreen({ navigation, route }) {
         i === idx ? { ...s, [field]: value } : s
       );
       const next = { ...prev, [selectedExercise]: updated };
+      // 로컬 캐시에 임시 저장 (서버 업로드 전까지 유지용)
+      // ⚠️ 주의: 영상 업로드 후 서버 데이터가 최종 진실 소스가 됨
       saveExerciseSetsToStorage(next);
       return next;
     });
@@ -618,10 +648,11 @@ export default function MyExerciseScreen({ navigation, route }) {
           { set: prev[selectedExercise].length + 1, weight: '', reps: '', feedbackVideo: null, analysisVideoUrl: null, memo: '', weightLocked: false, videoUploaded: false }
         ]
       };
-      // 즉시 저장하여 다른 화면 갔다 와도 유지되도록
+      // 로컬 캐시에 즉시 저장 (다른 화면 갔다 와도 유지되도록)
+      // ⚠️ 주의: 영상 업로드 전까지만 로컬에 유지, 업로드 후 서버 데이터로 교체됨
       saveExerciseSetsToStorage(next, selectedDate).then(() => {
-        console.log('✅ 세트 추가 후 저장 완료');
-        // 피드백도 함께 새로고침
+        console.log('✅ 세트 추가 후 로컬 캐시 저장 완료');
+        // 서버에서 최신 데이터 확인
         fetchFeedback();
       });
       return next;
@@ -667,14 +698,19 @@ export default function MyExerciseScreen({ navigation, route }) {
 
       const list = Array.isArray(payload?.items) ? payload.items : [];
       if (list.length > 0) {
-        const serverData = list.map(item => {
+        const serverData = list.map((item, idx) => {
           const memoFromAI = aiMemoFromItem(item);
+          
+          // 무게 데이터 추출: load_kg > weight > S3 키에서 추출
+          const weightFromS3 = extractWeightFromS3Key(item.s3_key);
+          const weightValue = item.load_kg || item.weight || weightFromS3;
+          const weight = weightValue ? String(weightValue) : ''; // 항상 문자열로 변환
           
           // AI 피드백이 있으면 그것을 사용, 없으면 분석 대기 중으로 표시
           let memo;
           if (memoFromAI) {
             memo = memoFromAI; // AI 피드백이 있음
-          } else if (!!item.weight) {
+          } else if (weight) {
             memo = '영상 업로드 완료 - 분석 대기 중...'; // 무게는 있지만 AI 피드백 없음 = 분석 중
           } else {
             memo = '피드백 없음'; // 무게도 없고 AI 피드백도 없음
@@ -685,12 +721,12 @@ export default function MyExerciseScreen({ navigation, route }) {
           
           return {
             exercise: selectedExercise,
-            weight: item.weight || '',
+            weight: weight,
             reps: item.rep_cnt || '',
             memo,
             analysisVideoUrl, // 분석 영상 URL 저장
-            weightLocked: !!item.weight,
-            videoUploaded: !!item.weight, // 서버에 무게 데이터가 있으면 영상 업로드 완료로 간주
+            weightLocked: !!weight,
+            videoUploaded: !!weight, // 서버에 무게 데이터가 있으면 영상 업로드 완료로 간주
           };
         });
 
@@ -942,7 +978,7 @@ export default function MyExerciseScreen({ navigation, route }) {
                     <TextInput
                       style={[
                         styles.weightInput,
-                        !set.weight || set.weight.trim() === '' ? styles.weightInputRequired : null,
+                        !set.weight || String(set.weight).trim() === '' ? styles.weightInputRequired : null,
                         (set.weightLocked || isAnalyzed || !isToday) ? styles.weightInputLocked : null
                       ]}
                       value={set.weight?.toString() ?? ''}
@@ -1097,13 +1133,13 @@ export default function MyExerciseScreen({ navigation, route }) {
                       <TouchableOpacity
                         style={[
                           styles.uploadButton,
-                          (!set.weight || set.weight.trim() === '' || set.videoUploaded) ? styles.uploadButtonDisabled : null
+                          (!set.weight || String(set.weight).trim() === '' || set.videoUploaded) ? styles.uploadButtonDisabled : null
                         ]}
                         onPress={() => handleVideoUpload(idx)}
-                        disabled={!set.weight || set.weight.trim() === '' || set.videoUploaded}>
+                        disabled={!set.weight || String(set.weight).trim() === '' || set.videoUploaded}>
                         <View style={[
                           styles.uploadContainer,
-                          set.weight && set.weight.trim() !== '' && !set.videoUploaded ? styles.uploadActive : styles.uploadInactive
+                          set.weight && String(set.weight).trim() !== '' && !set.videoUploaded ? styles.uploadActive : styles.uploadInactive
                         ]}>
                           <Text style={styles.uploadIcon}>📹</Text>
                           <Text style={styles.uploadText}>영상 업로드</Text>
